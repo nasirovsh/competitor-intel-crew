@@ -1,0 +1,17 @@
+services:
+  competitor-intel:
+    build: .
+    image: competitor-intel-crew:latest
+    ports:
+      - "8501:8501"
+    environment:
+      # Provide your keys via a local .env file (never commit real keys).
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-5}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    # Compose auto-loads a local .env in this directory for the ${...} values above.
+    volumes:
+      # Persist the scrape cache and generated reports across runs.
+      - ./.cache:/app/.cache
+      - ./reports:/app/reports
