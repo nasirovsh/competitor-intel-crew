@@ -11,7 +11,11 @@ the package (scraper, cache, cost, models) stay import-light and fast to test.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+import json
+from collections.abc import Iterator
+from typing import Any, Protocol, TypeVar
+
+from pydantic import BaseModel, ValidationError
 
 from .config import Config
 from .cost import usage_from_crew
@@ -25,6 +29,13 @@ from .models import (
 
 # Page text handed to the LLM is capped to keep prompts (and cost) bounded.
 _MAX_PAGE_CHARS = 12_000
+
+# Shown in the report when the model returns output the schema can't accept.
+_UNPARSEABLE_NOTE = (
+    "The model returned output that could not be parsed into the expected structured format."
+)
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
 class SummarizerService(Protocol):
@@ -61,7 +72,90 @@ def build_llm(config: Config) -> Any:
 def _kickoff(crew: Any, inputs: dict[str, Any]) -> tuple[Any, TokenUsage]:
     result = crew.kickoff(inputs=inputs)
     usage = usage_from_crew(getattr(result, "token_usage", None))
-    return result.pydantic, usage
+    return result, usage
+
+
+def _json_candidates(text: str) -> Iterator[str]:
+    """Yield plausible JSON snippets from a raw LLM string.
+
+    Tries the whole string first, then the widest ``{...}`` span so a JSON
+    object wrapped in prose or Markdown fences can still be recovered.
+    """
+    yield text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        yield text[start : end + 1]
+
+
+def _parse_result(result: Any, model_cls: type[_ModelT]) -> _ModelT | None:
+    """Coerce a crew result into ``model_cls``.
+
+    CrewAI populates ``result.pydantic`` when it can parse the LLM output into
+    the task's ``output_pydantic`` schema, but leaves it ``None`` when it can't.
+    In that case we fall back to parsing the raw text ourselves. Returns
+    ``None`` when no valid instance can be produced so callers can substitute a
+    clear, typed failure instead of dereferencing ``None``.
+    """
+    if result is None:
+        return None
+    parsed = getattr(result, "pydantic", None)
+    if isinstance(parsed, model_cls):
+        return parsed
+    raw = getattr(result, "raw", None)
+    if raw is None:
+        raw = str(result)
+    text = str(raw).strip()
+    if not text:
+        return None
+    for candidate in _json_candidates(text):
+        try:
+            data = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        try:
+            return model_cls.model_validate(data)
+        except ValidationError:
+            continue
+    return None
+
+
+def _summary_from_result(result: Any, url: str) -> CompetitorSummary:
+    """Typed summary from a crew result, or a clear fallback on parse failure."""
+    summary = _parse_result(result, CompetitorSummary)
+    if summary is None:
+        summary = CompetitorSummary(url=url, positioning=_UNPARSEABLE_NOTE, confidence=0.0)
+    summary.url = url
+    return summary
+
+
+def _report_from_result(result: Any, url: str) -> FaithfulnessReport:
+    """Typed faithfulness report, or a failing fallback on parse failure.
+
+    A fallback scores 0 with an unsupported claim, so the flow's revision loop
+    treats it as a failed attempt eligible for retry rather than crashing.
+    """
+    report = _parse_result(result, FaithfulnessReport)
+    if report is None:
+        report = FaithfulnessReport(
+            url=url,
+            score=0.0,
+            passed=False,
+            unsupported_claims=["evaluator output could not be parsed"],
+            feedback=_UNPARSEABLE_NOTE,
+        )
+    report.url = url
+    return report
+
+
+def _insights_from_result(result: Any) -> CompetitiveInsights:
+    """Typed insights from a crew result, or a clear fallback on parse failure."""
+    insights = _parse_result(result, CompetitiveInsights)
+    if insights is None:
+        insights = CompetitiveInsights(overview=_UNPARSEABLE_NOTE)
+    return insights
 
 
 def _page_excerpt(page: CompetitorPage) -> str:
@@ -128,8 +222,8 @@ class CrewSummarizer:
             process=Process.sequential,
             verbose=self.config.verbose,
         )
-        summary, usage = _kickoff(crew, {"url": page.url})
-        summary.url = page.url
+        result, usage = _kickoff(crew, {"url": page.url})
+        summary = _summary_from_result(result, page.url)
         if feedback:
             summary.revision += 1
         return summary, usage
@@ -187,8 +281,8 @@ class CrewEvaluator:
             process=Process.sequential,
             verbose=self.config.verbose,
         )
-        report, usage = _kickoff(crew, {"url": page.url})
-        report.url = page.url
+        result, usage = _kickoff(crew, {"url": page.url})
+        report = _report_from_result(result, page.url)
         report.passed = (
             report.score >= self.config.faithfulness_threshold and not report.unsupported_claims
         )
@@ -246,4 +340,5 @@ class CrewAnalyst:
             process=Process.sequential,
             verbose=self.config.verbose,
         )
-        return _kickoff(crew, {})
+        result, usage = _kickoff(crew, {})
+        return _insights_from_result(result), usage

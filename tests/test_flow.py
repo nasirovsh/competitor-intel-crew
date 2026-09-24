@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from competitor_intel.cost import CostTracker
+from competitor_intel.crew import (
+    _UNPARSEABLE_NOTE,
+    _insights_from_result,
+    _report_from_result,
+    _summary_from_result,
+)
 from competitor_intel.flow import CompetitorIntelFlow
 from competitor_intel.models import (
     ComparisonRow,
@@ -161,6 +167,59 @@ def test_keeps_best_attempt_when_revisions_exhausted(scraper: Scraper, config):
     assert len(state.summaries) == 1
     assert any("kept best attempt" in d for d in state.decisions)
     assert state.insights is not None
+
+
+class UnparseableSummarizer:
+    """Mimics CrewSummarizer when the model output can't be parsed."""
+
+    def __call__(self, page: CompetitorPage, feedback: str | None = None):
+        summary = _summary_from_result(None, page.url)
+        if feedback:
+            summary.revision += 1
+        return summary, _usage()
+
+
+class UnparseableEvaluator:
+    """Mimics CrewEvaluator when the critic output can't be parsed."""
+
+    def __call__(self, page: CompetitorPage, summary: CompetitorSummary):
+        return _report_from_result(None, page.url), _usage()
+
+
+class UnparseableAnalyst:
+    """Mimics CrewAnalyst when the analysis output can't be parsed."""
+
+    def __call__(self, summaries: list[CompetitorSummary]):
+        return _insights_from_result(None), _usage()
+
+
+def test_flow_survives_unparseable_summarizer_and_evaluator(scraper: Scraper, config):
+    # A summarizer/evaluator that always yield the typed fallback must not crash
+    # the flow; the run degrades to a best-attempt with a below-threshold report.
+    state, _ = _run(
+        scraper,
+        ["https://acme.example.com/pricing"],
+        config,
+        summarizer=UnparseableSummarizer(),
+        evaluator=UnparseableEvaluator(),
+    )
+    assert len(state.summaries) == 1
+    assert state.summaries[0].positioning == _UNPARSEABLE_NOTE
+    assert state.faithfulness[0].passed is False
+    assert any("kept best attempt" in d for d in state.decisions)
+    # The flow still reaches analysis rather than raising AttributeError.
+    assert state.insights is not None
+
+
+def test_flow_survives_unparseable_analyst(scraper: Scraper, config):
+    state, _ = _run(
+        scraper,
+        ["https://acme.example.com/pricing"],
+        config,
+        analyst=UnparseableAnalyst(),
+    )
+    assert state.insights is not None
+    assert state.insights.overview == _UNPARSEABLE_NOTE
 
 
 def test_aborts_when_no_usable_pages(scraper: Scraper, config):
